@@ -82,6 +82,17 @@
 | ステータス更新 | `ステータスを「下書き準備済み」に戻しました` | 成功レベル |
 | エラーメモ保存 | `エラーメモを更新しました` | 成功レベル |
 
+### 認証・アクセス制御（ダッシュボード）
+- NextAuth.js + Credentials Provider を利用し、`.env.local` / Vercel Secrets に設定した単一の管理者メールアドレス・パスワードで認証する。
+  - `ADMIN_EMAIL`, `ADMIN_PASSWORD` を環境変数に定義し、アカウント追加は想定しない。
+- ロールは `admin` のみ。ログインしたユーザーだけが一覧閲覧・送信・再送信・ステータス更新などすべての操作を行える。
+- 未ログイン時は `/login` ページへリダイレクトし、ダッシュボードコンテンツは表示しない。
+- パスワードリセット機能は提供せず、環境変数の更新 + 再デプロイで対応。
+- セッション有効期限はブラウザのセッションに任せ、特別な期限を設けない。
+- アクセス制御は App Router の `middleware.ts` で実装し、未認証リクエストは `/login` へ強制誘導。
+- Server Action / API Route はセッション確認後にユースケースを呼び出す。認証エラー時は 401 を返し、ログインページへ誘導。
+- 送信・再送信実行時には操作ログ（ユーザーID、操作内容、対象商品、タイムスタンプ）を `SubmissionJob` と同時に記録し、30 日以上保持する。
+
 ## 主要機能
 - Google Sheetsからの商品データ取得・同期（差分検知、ステータス更新）。
 - PFごとの入力項目マッピングとバリデーション。
@@ -214,10 +225,10 @@ export interface PlatformAdapter {
 - **クリーンアップ**: 実行後にブラウザインスタンスを確実に閉じ、セッション・Cookie を破棄。必要に応じて Playwright の `context.storageState` を用いてログイン状態をキャッシュし、期限切れ時のみ再ログインする。
 - **監視指標**: `MetricsPort` でジョブ成功数、失敗数、平均処理時間、タイムアウト発生数などを記録。Dashbord で日次集計を表示することを検討。
 
-## 想定データモデル（初期案）
-- `Product`: スプレッドシートと同期する商品情報。タイトル、説明、価格、タグ、画像参照先のメタ情報、PF別の出品ステータスを保持。
-- `SubmissionJob`: 実行された自動投稿ジョブの履歴。対象PF、開始・終了時刻、結果、エラー内容など。
-- `PlatformConfig`: PF固有の入力マッピング・必須項目・バリデーションルール。
+## データ保持方針
+- 当面は Google スプレッドシートをマスターデータとして利用し、アプリは同期・送信・進捗管理を担う。
+- `Product` や `SubmissionJob` の情報もスプレッドシートとログ（Playwright 実行結果）で管理し、専用データベースは導入しない。
+- 将来的に検索パフォーマンスやバックアップ用途で必要になった場合にのみ、Postgres / Supabase などの永続化スキーマを別途検討する。
 
 ### Google Sheets 項目定義（ドラフト）
 Creema / minne 双方の要件を満たすために、シート上では両PFの項目を包含するスキーマを採用する。未対応PF向けの項目は空欄で構わず、どの列を参照するかはアダプタ側で判定する。
@@ -338,6 +349,10 @@ PLAYWRIGHT_MINNE_PASSWORD=<password>
 # セッション管理・通知
 SESSION_SECRET=<random string>
 SLACK_WEBHOOK_URL=<https://hooks.slack.com/...>
+
+# Dashboard Admin Credentials
+ADMIN_EMAIL=<admin@example.com>
+ADMIN_PASSWORD=<strong password>
 ```
 
 #### シークレットローテーション手順
@@ -388,10 +403,85 @@ SLACK_WEBHOOK_URL=<https://hooks.slack.com/...>
 - **CI/CD**: GitHub連携による自動デプロイ、PlaywrightテストのCI実行。
 - **環境変数管理**: VercelのEnvironment VariablesとSecret Storeを使用。
 
+### CI/CD & テスト運用フロー
+- **ブランチ戦略**: `main` を本番ブランチとし、機能開発は `feature/*` ブランチで行う。PR を作成し、レビュー後に `main` へマージ。
+- **Pull Request チェック**:
+  - `pnpm lint`
+  - `pnpm test`（必要に応じてユニットテスト）
+  - `pnpm exec playwright test --config playwright.config.ci.ts` （短いスモークテスト）
+- **CI 実行環境**: GitHub Actions を利用し、`pnpm install --frozen-lockfile` → `pnpm build` → テストの順で実行。
+- **Playwright テスト**: CI ではヘッドレス + 最小ケースのみ実行。フルシナリオはローカル/ステージングで手動実行。
+- **デプロイフロー**:
+  - `main` へのマージで Vercel の Production に自動デプロイ。
+  - PR 作成時は Preview デプロイを生成し、動作確認を行う。
+- **ロールアウト**: デプロイ完了後、ダッシュボードでテスト商品を使った送信スモークテストを行い、通知・ステータス更新が正常に動作するか確認。
+- **ロールバック**: 問題発生時は Vercel の Rollback 機能で前バージョンに切り戻し、修正後に再デプロイ。
+
+#### 開発フロー（初心者向け）
+1. リポジトリをクローン: `git clone ...` → `pnpm install` → `.env.local` を `.env.example` からコピーし、必要な環境変数（特に `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `PLAYWRIGHT_*`）を設定。
+2. Playwright の初回セットアップ: `pnpm dlx playwright install --with-deps` → `pnpm exec playwright install-deps`（必要な場合）。
+3. 新しいブランチを作成: `git switch -c feature/<my-task>`。
+4. ローカルで開発: `pnpm dev` で起動し、ダッシュボードにアクセス（`/login` → 管理者アカウントでログイン）。必要に応じて `pnpm lint`, `pnpm test`, `pnpm exec playwright test` を実行。
+5. 作業内容をコミット: `git add`, `git commit`。小さな粒度でコミットし、メッセージを明確に。
+6. リモートへブランチを push: `git push origin feature/<my-task>`。
+7. GitHub で Pull Request を作成し、CI が通っていることを確認した上でレビューを依頼。
+8. レビュー指摘を反映後、Approve を得て `main` へマージ。自動で Vercel Production にデプロイ。
+9. 本番のダッシュボードでテスト商品を使ったスモークテストを行い、問題なければタスク完了。必要に応じて Issue やタスク管理ツールを更新。
+
 ## 今後の検討事項
 - 画像管理フローの再整理（microCMS導入タイミング、サイズ圧縮、カテゴリ整理など）。
 - 手動介入を支援するUI改善（差分比較、プレビュー画面、チェックリスト）。
 - 法令対応（特商法、個人情報保護）やコンプライアンス確認プロセス。
+
+## 開発〜運用移行チェックリスト
+- [x] GitHub リポジトリを作成し、`.gitignore` に `.env*` や `playwright/.auth` を追加する。
+- [ ] README（本ドキュメント）を `main` ブランチに反映し、`feature/*` ブランチ運用を開始する。
+- [x] `pnpm create next-app`（App Router / TypeScript）でプロジェクトを生成する。
+- [x] Tailwind CSS・shadcn/ui・lucide-react を導入し、共通スタイルを整備する。
+- [x] `pnpm dlx shadcn-ui init` などで UI コンポーネント生成基盤を整える。
+- [x] NextAuth.js（Credentials Provider）を導入し、`.env.local` に `ADMIN_EMAIL` / `ADMIN_PASSWORD` を設定する。
+- [x] `.env.example` を更新し、必要な環境変数（Google Sheets / Playwright 等）を共有する。
+- [ ] Service Account を発行し、対象 Spreadsheet へのアクセス権を付与する。
+- [ ] `GOOGLE_SERVICE_ACCOUNT_BASE64` / `GOOGLE_SHEETS_SPREADSHEET_ID` を設定し、読み書きの PoC を実施する。
+- [ ] ダッシュボード・商品詳細モーダル・ジョブステータスビューを実装し、Server Action でユースケースを呼び出す。
+- [ ] トースト通知・操作ログ記録など UI の基本動作を完成させる。
+- [ ] Playwright スクリプトを作成し、ログイン〜下書き保存直前までの自動化を実装する。
+- [ ] CI 用スモークテストとローカル/ステージング用フルテストを用意する。
+- [ ] GitHub Actions ワークフローで `pnpm lint` / `pnpm test` / Playwright スモークテストを実行する。
+- [ ] Vercel をリポジトリに接続し、Preview / Production デプロイを確認する。
+- [ ] このリポジトリに合わせて Vercel の環境変数を設定し、開発メンバーが `vercel env pull` で取得できるようにする。
+- [ ] Google Sheets にテスト商品を登録し、同期→送信→下書き確認フローを通す。
+- [ ] エラーハンドリング・ログ保存・操作ログ記録が期待通りか確認する。
+- [ ] 運用チェックリストに沿って最終確認し、Playwright スモークテストや手動操作を完了する。
+- [ ] 本番シートに商品を投入し、Playwright 更新・ログ確認・資格情報ローテーションなど定期メンテナンスを開始する。
+
+## 運用チェックリスト
+- **送信前（シート側）**
+  - 必須項目（タイトル、価格、説明、カテゴリ、発送元、出品先、ステータス）が埋まっているか確認。
+  - PF固有の列（カテゴリID、発送方法ID など）に漏れがないかチェック。
+  - 画像URL、タグが仕様に沿っているか（枚数・文字数・形式）。
+- **送信前（ダッシュボード側）**
+  - 最新同期を実行し、対象商品のステータスが「下書き準備済み」になっているか確認。
+  - 対象商品を選択し、送信前に詳細モーダルで内容を再確認。
+- **送信中 / エラー発生時**
+  - トースト通知で進捗を確認。失敗時はエラーメッセージを控え、`last_error_message` を参照。
+  - 原因がスプレッドシートの入力不備であれば修正後にステータスを「下書き準備済み」に戻し、再送信。
+  - PF 側の仕様変更などが疑われる場合は Playwright をヘッドフルモードで再実行し、DOM 変更点を調査。
+- **下書き確認・公開**
+  - Creema / minne の管理画面で下書きを開き、商品情報・画像が正しく反映されているか確認。
+  - 必要に応じて微調整し、手動で公開。公開後はシートのステータスを「公開済み」に更新。
+- **定期的なメンテナンス**
+  - 定期的にテスト商品で送信スモークテストを実施し、Playwright ジョブの正常性を確認。
+  - 操作ログ（ジョブ履歴）を 30 日単位で確認し、異常なエラーが増えていないかを見る。
+  - 環境変数や認証情報の期限切れがないか四半期ごとにチェック。
+
+## 監視・アラート方針
+- **ログ収集**: Playwright ジョブ実行時のログ・スクリーンショット・HTML ダンプを `SubmissionJob` とストレージに保存。異常時に復旧しやすいようメッセージを詳細に残す。
+- **メトリクス**: `MetricsPort` でジョブ成功数、失敗数、平均処理時間、タイムアウト件数を収集。日次でダッシュボードに集計し、増減を確認する。
+- **しきい値**: 直近 10 ジョブで 3 件以上失敗した場合、または 1 ジョブの処理時間が 5 分を超えた場合は手動調査を実施（ヘッドフル再現・DOM 変更確認）。
+- **通知手段**: 現時点では管理画面のトースト通知を中心に運用し、監視で検知した異常は週次レポートや Issue 化で共有。Slack / メール通知は将来必要になった際に `NotificationPort` 経由で追加する。
+- **エラー追跡**: Playwright で捕捉した例外を Sentry などのエラートラッキング（導入検討中）に送信できるようにし、ブラウザ操作エラーと Node.js 例外を可視化する。
+- **定期レビュー**: 四半期に一度、失敗ログ・メトリクス・復旧履歴を振り返り、リトライポリシーや Playwright スクリプトの改善に活かす。
 
 ---
 このREADMEが常に最新の仕様・方針を反映するよう、変更時は内容をレビューしてから反映してください。
